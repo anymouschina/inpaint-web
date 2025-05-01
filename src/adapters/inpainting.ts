@@ -194,15 +194,27 @@ const resizeMark = (
   })
 }
 let model: ArrayBuffer | null = null
+/**
+ * 图像修复/填充主函数
+ * 该函数使用AI模型对图像进行修复，根据提供的蒙版填充图像中的缺失或需要修改的区域
+ * 
+ * @param imageFile - 输入图像，可以是文件对象或HTMLImageElement
+ * @param maskBase64 - 蒙版图像的Base64编码字符串，白色区域表示需要修复的部分
+ * @returns 修复后的图像的Data URL
+ */
 export default async function inpaint(
   imageFile: File | HTMLImageElement,
   maskBase64: string
 ) {
   console.time('sessionCreate')
   if (!model) {
+    // 检测设备能力（WebGPU、WASM等）
     const capabilities = await getCapabilities()
+    // 根据设备能力配置ONNX运行环境
     configEnv(capabilities)
+    // 加载修复模型
     const modelBuffer = await ensureModel('inpaint')
+    // 创建推理会话，优先使用WebGPU加速，不支持则使用WASM
     model = await ort.InferenceSession.create(modelBuffer, {
       executionProviders: [capabilities.webgpu ? 'webgpu' : 'wasm'],
     })
@@ -210,62 +222,78 @@ export default async function inpaint(
   console.timeEnd('sessionCreate')
   console.time('preProcess')
 
+  // 并行加载原始图像和蒙版图像
   const [originalImg, originalMark] = await Promise.all([
+    // 如果输入已经是图像元素就直接使用，否则从文件创建
     imageFile instanceof HTMLImageElement
       ? imageFile
       : loadImage(URL.createObjectURL(imageFile)),
+    // 加载蒙版图像
     loadImage(maskBase64),
   ])
 
+  // 并行处理图像和蒙版
   const [img, mark] = await Promise.all([
+    // 处理原图
     processImage(originalImg),
+    // 调整蒙版尺寸与原图匹配，并处理
     processMark(
       await resizeMark(originalMark, originalImg.width, originalImg.height)
     ),
   ])
 
+  // 创建图像张量 - NCHW格式(批次-通道-高度-宽度)
   const imageTensor = new ort.Tensor('uint8', img, [
-    1,
-    3,
-    originalImg.height,
-    originalImg.width,
+    1,                  // 批次大小
+    3,                  // RGB三通道
+    originalImg.height, // 高度
+    originalImg.width,  // 宽度
   ])
 
+  // 创建蒙版张量 - NCHW格式
   const maskTensor = new ort.Tensor('uint8', mark, [
-    1,
-    1,
-    originalImg.height,
-    originalImg.width,
+    1,                  // 批次大小
+    1,                  // 单通道(灰度)
+    originalImg.height, // 高度
+    originalImg.width,  // 宽度
   ])
 
+  // 准备模型输入
   const Feed: {
     [key: string]: any
   } = {
-    [model.inputNames[0]]: imageTensor,
-    [model.inputNames[1]]: maskTensor,
+    [model.inputNames[0]]: imageTensor, // 原始图像
+    [model.inputNames[1]]: maskTensor,  // 蒙版图像
   }
 
   console.timeEnd('preProcess')
 
+  // 运行模型推理
   console.time('run')
   const results = await model.run(Feed)
   console.timeEnd('run')
 
+  // 处理模型输出
   console.time('postProcess')
+  // 获取输出张量(修复后的图像)
   const outsTensor = results[model.outputNames[0]]
+  // 将CHW格式转换为HWC格式，并转换像素值范围
   const chwToHwcData = postProcess(
     outsTensor.data,
     originalImg.width,
     originalImg.height
   )
+  // 创建ImageData对象用于显示
   const imageData = new ImageData(
     new Uint8ClampedArray(chwToHwcData),
     originalImg.width,
     originalImg.height
   )
   console.log(imageData, 'imageData')
+  // 转换为Data URL
   const result = imageDataToDataURL(imageData)
   console.timeEnd('postProcess')
 
+  // 返回修复后的图像URL
   return result
 }
